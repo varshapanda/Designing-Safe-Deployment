@@ -1,0 +1,265 @@
+name: Safe Deployment Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - fix/pipeline
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deployment-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Record source traceability
+        run: |
+          echo "commit_sha=${GITHUB_SHA}"
+          echo "timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "ref=${GITHUB_REF}"
+
+  build:
+    runs-on: ubuntu-latest
+    needs: source
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run build validation
+        run: npm run build
+
+      - name: Run lint gate
+        run: npm run lint
+
+      - name: Create deployment artifact
+        run: |
+          mkdir -p artifacts
+          tar -czf artifacts/deployment-package.tgz \
+            src \
+            scripts \
+            package.json \
+            package-lock.json \
+            README.md
+          cat > artifacts/build-metadata.json <<EOF
+          {
+            "commit_sha": "${GITHUB_SHA}",
+            "branch": "${GITHUB_REF_NAME}",
+            "created_at_utc": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+            "status": "build-complete"
+          }
+          EOF
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-package
+          path: artifacts/
+          retention-days: 7
+
+  test:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-package
+          path: artifacts
+
+      - name: Run unit and integration tests with coverage
+        run: npm test -- --coverage
+
+  security:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Dependency audit
+        run: npm audit --audit-level=high
+
+      - name: Secret scan
+        run: |
+          if git grep -nE '(AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY|PASSWORD=|SECRET=|TOKEN=)' -- . ':!node_modules' ':!package-lock.json' ':!.env.example' ':!.github/workflows/deployment-pipeline.yml'; then
+            echo "Potential secret pattern detected"
+            exit 1
+          fi
+
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: security
+    if: github.event_name == 'push'
+    environment:
+      name: staging
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-package
+          path: artifacts
+
+      - name: Deploy to staging
+        run: |
+          echo "[staging] commit=${GITHUB_SHA}"
+          echo "[staging] timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "[staging] deploying artifact from artifacts/deployment-package.tgz"
+
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-package
+          path: artifacts
+
+      - name: Deploy to production
+        run: |
+          echo "[production] commit=${GITHUB_SHA}"
+          echo "[production] timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "[production] deploying artifact from artifacts/deployment-package.tgz"
+
+  verify:
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-package
+          path: artifacts
+
+      - name: Start app for smoke verification
+        run: |
+          npm ci
+          nohup npm start > /tmp/orion-api.log 2>&1 &
+          echo $! > /tmp/orion-api.pid
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:3000/health; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Smoke verification failed"
+          cat /tmp/orion-api.log
+          exit 1
+
+      - name: Record verification status
+        if: always()
+        run: |
+          echo "[verify] commit=${GITHUB_SHA}"
+          echo "[verify] timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "[verify] status=${{ job.status }}"
+
+  rollback:
+    runs-on: ubuntu-latest
+    needs:
+      - deploy-production
+      - verify
+    if: ${{ failure() && needs.deploy-production.result == 'success' }}
+    environment:
+      name: production
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deployment-package
+          path: artifacts
+
+      - name: Roll back failed production release
+        env:
+          ROLLBACK_TAG: ${{ vars.ROLLBACK_TAG }}
+        run: |
+          echo "[rollback] commit=${GITHUB_SHA}"
+          echo "[rollback] timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          if [ -z "${ROLLBACK_TAG}" ]; then
+            echo "Rollback tag is not configured. Set repository variable ROLLBACK_TAG to the last known good release tag."
+            exit 1
+          fi
+          bash scripts/rollback.sh "${ROLLBACK_TAG}"
+
+  notify:
+    runs-on: ubuntu-latest
+    needs:
+      - source
+      - build
+      - test
+      - security
+      - deploy-staging
+      - deploy-production
+      - verify
+      - rollback
+    if: always()
+    steps:
+      - name: Publish pipeline summary
+        run: |
+          echo "[notify] commit=${GITHUB_SHA}"
+          echo "[notify] timestamp=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "[notify] source=${{ needs.source.result }}"
+          echo "[notify] build=${{ needs.build.result }}"
+          echo "[notify] test=${{ needs.test.result }}"
+          echo "[notify] security=${{ needs.security.result }}"
+          echo "[notify] deploy-staging=${{ needs.deploy-staging.result }}"
+          echo "[notify] deploy-production=${{ needs.deploy-production.result }}"
+          echo "[notify] verify=${{ needs.verify.result }}"
+          echo "[notify] rollback=${{ needs.rollback.result }}"
